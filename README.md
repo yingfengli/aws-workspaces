@@ -1,2 +1,2 @@
 # aws-workspaces
-add security and management for workspaces
+This repo focused on adding security and management for aws workspaces service.
