@@ -1,0 +1,371 @@
+
+
+本方案将展示如何配置 Amazon WorkSpaces的双重身份验证。Amazon WorkSpaces是一个托管的，安全的云桌面服务。您可以使用 Amazon WorkSpaces 在几分钟内提供 Windows 或 Linux 桌面。有了Amazon WorkSpaces，你可以迅速扩大规模，为全球的员工提供数千台台式机。
+MFA 为用户名和密码(第一个“因素”)增加了额外的保护层。使用 MFA 时，必须输入身份验证码(第二个因素) ，这是由 MFA 解决方案提供的。
+对于 Amazon WorkSpaces 上的 MFA，您需要一个remote authentication dial-in user service(RADIUS)，也就是远端用户拨入验证服务系统，该系统可以验证一次性密码。现在您可以使用FreeRadius+LinOTP来实现Amazon WorkSpaces的双重身份认证。客户端的动态code可以用手机app的一次性密码来实现，支持Microsoft 或Google的Authenticator app。
+ 
+主要步骤：
+ 步骤1和2：用户通过手机的Authenticator APP获得MFA一次性密码。
+ 第3步：WorkSpaces 客户端将第一个因素域用户名和密码以及第二个因素的一次性密码发送到 AWS 目录服务。
+ 步骤4和5：AWS 目录服务检验第一个因素的AD域凭据。
+ 步骤6：AWS 目录服务将第二个因素的一次性密码发送到Free RADIUS 服务器。
+ 步骤7：FreeRADIUS 服务器验证MFA一次性密码。
+ 步骤8：完成双重身份验证，用户访问Amazon WorkSpaces云桌面。
+
+
+在开始之前，你需要在AWS环境配置了Amazon WorkSpaces和AWS目录服务，可以用AD的用户名和密码进行登录Workspaces。详见 快速上手 Amazon WorkSpaces 云中的虚拟桌面（https://aws.amazon.com/cn/blogs/china/get-started-with-virtual-desktops-in-the-amazon-workspaces-cloud/）
+所以以下为：
+•	已经配置好的 WorkSpaces。
+•	已经创建的AWS 目录服务，比如AWS Managed AD 
+•	一个EC2 实例，基于 Amazon Linux 2 AMI（如一个 T3.medium）
+•	LinOTP for Active Directory 集成 (自助服务门户)
+•	MariaDB or MySQL (在本方案中，使用 MariaDB)
+•	FreeRADIUS (RADIUS服务器) GPLv2 License
+•	安装有Google Authenticator 或 Microsoft Authenticator的智能手机
+
+
+一、为Radius服务准备EC2实例
+1.安装更新和repository
+sudo yum -y update
+sudo amazon-linux-extras install epel -y
+
+sudo yum localinstall http://linotp.org/rpm/el7/linotp/x86_64/Packages/LinOTP_repos-1.1-1.el7.x86_64.rpm -y
+
+2.安装MariadB，启用服务和安全
+sudo yum install mariadb-server -y
+sudo systemctl enable mariadb
+
+sudo systemctl start mariadb
+【sudo mysql_secure_installation】
+
+3.安装LinOTP，httpd和配置MariaDB
+sudo yum install -y LinOTPLinOTP_mariadb
+sudo restorecon -Rv /etc/linotp2/
+sudo restorecon -Rv /var/log/linotp
+
+4配置  LinOTP and MariaDB credentials 
+sudo linotp-create-mariadb 
+
+5锁定python-repoze-who 版本
+sudo yum install yum-plugin-versionlock -y
+sudo yum versionlock python-repoze-who
+
+6安装apache and vhost 配置
+sudo yum install LinOTP_apache -y
+sudo systemctl enable httpd
+
+sudo systemctl start httpd
+sudo mv /etc/httpd/conf.d/ssl.conf /etc/httpd/conf.d/ssl.conf.back
+sudo mv /etc/httpd/conf.d/ssl_linotp.conf.template /etc/httpd/conf.d/ssl_linotp.conf
+
+
+二 配置LinOTP，并和AD集成
+1.修改LinOTP管理员密码
+sudo htdigest /etc/linotp2/admins "LinOTP2 admin area" admin
+new password: Welcome1
+
+2.重新启动Radius实例，配置安全组
+
+（1）	添加Radius实例的安全组：
+允许80和443的入站策略，源选择radius实例所在网段（也可以加上自己的笔记本公网ip）
+允许对UDP 1812的入站策略，源选择域控所在的两个网段。
+（2）添加域控的安全组： 在安全组中搜索directory controllers
+，找到对应目录服务的域控安全组，修改该安全组，允许对UDP 1812出站策略，目标为radius实例所在的网段。
+ 
+
+3.在浏览器输入 https://radius-ip/manage,输入admin和密码Welcome1
+
+4.点击“LinOTP配置”，选择用户ID解析器，配置对aws目录服务的访问。
+ 
+点击新建
+ 
+
+选择LDAP
+ 
+具体的配置如下：
+ 
+
+Resolver Name：alcc 【可自定义】
+Server-URI：ldap://ad域的DNS或IP地址【2个dc都需要配置】
+BaseDN： OU=alcc,DC=alcc,DC=com 【目录服务的域名为alcc.com】
+BindDN: CN=Admin，OU=Users，OU=alcc,DC=alcc,DC=com
+BindPassword：Welcome1 【域管理员admin的密码】
+
+可以点击“Test LDAP server connection”测试和域的连接。
+
+ 
+测试成功后，点击预设活动目录，点击“save”保存配置。
+ 
+创建完成，点击“关闭”
+
+提示需要新建一个realm
+ 
+点击新建，输入alcc，选择刚刚创建的resolver：alcc，并点击保存。
+ 
+
+在管理界面，点击“查看用户”
+ 
+可以看到AD中现有的用户。
+【如果AD中没有用户，可以在workspaces的管理页面，创建多个用户（必须要填写邮件地址）。修改用户密码可以在在aws目录服务的“重置密码”】
+
+
+6.创建policy的配置文件policy.csv
+[Limit_to_one_token]
+realm = *
+name = Limit_to_one_token
+action = maxtoken=1
+client = *
+user = *
+time = * * * * * *;
+active = True
+scope = enrollment
+[OTP_to_authenticate]
+realm = *
+name = OTP_to_authenticate
+action = otppin = token_pin
+client = *
+user = *
+time = * * * * * *;
+active = True
+scope = authentication
+[Require_MFA_at_Self_Service_Portal]
+realm = *
+name = Require_MFA_at_Self_Service_Portal
+active = False
+client = *
+user = *
+time = * * * * * *;
+action = mfa_login
+scope = selfservice
+[Default_Policy]
+realm = *
+name = Default_Policy
+active = True
+client = *
+user = *
+time = * * * * * *;
+action = "enrollTOTP, reset, resync, setOTPPIN, disable"
+scope = selfservice
+
+点击导入策略， 
+选择policy.csv,导入policy文件
+ 
+查看策略
+ 
+可以对策略进行修改，比如maxtoken=3,可以让每个用户有3个token。
+
+三、为用户注册token
+1.确认radius实例的80，443和1812的入站策略
+2.访问radius实例的公网ip: https://radius-public-ip 
+ 
+然后用ad域的用户名和密码登陆，进入到自助服务界面。
+
+	手机端采用Microsoft Authenticator的用户
+采用Microsoft Authenticator的用户，需要按照以下的配置生成Token
+ 
+
+点击“注册TOTP令牌”，出现二维码页面
+ 
+
+打开手机安装好的Microsoft Authenticator应用，点击添加，选择“个人账户”
+ 
+点击“扫描QR码”，并扫描页面的二维码
+ 
+在app应用中成功添加一个账户aaa的token。
+
+
+	手机端采用Google Authenticator
+采用Google Authenticator的用户，需要按照以下的配置生成Token
+ 
+点击注册“TOTP令牌”，出现二维码页面
+ 
+打开Google Authenticator，添加，选择“扫描条形码”
+ 
+用户aaa的token成功添加到app应用中。
+
+
+3.管理员为用户添加token的操作
+访问 https://radius-public-ip/manage
+在“查看用户”中，选中一个用户ccc，点击左侧的“注册”按钮
+ 
+	手机端采用Microsoft Authenticator的用户
+选择令牌类型为“HMAC基于时间”，进行注册。
+ 
+成功后，系统提示：
+ 
+用Microsoft authenticator，添加个人用户，并扫描二维码。
+ ¬¬
+ccc用户的token成功添加到app中。
+
+回到“查看令牌”界面，看已经创建的token信息
+ 
+
+
+访问以下链接，测试token
+https://[IPAddressofRADIUS]/validate/check?user=USERNAME&pass=PINOTP
+返回以下的值 value：true，则token验证成功。
+ 
+	手机端采用Google Authenticator
+在管理界面的“查看用户”，选中用户ccc，并点击“注册”
+ 
+ 
+点击注册，出现二维码页面
+ 
+用Google Authenticator添加，并扫描二维码
+ 
+用户ccc的token成功添加到app应用中。
+四、安装和配置FreeRadius
+1.登陆radius实例
+2.安装和配置freeRadius
+sudo yum install freeradius freeradius-perl freeradius-utils perl-App-cpanminus perl-LWP-Protocol-https perl-Try-Tiny git -y
+sudo cpanm Config::File
+sudo mv /etc/raddb/clients.conf /etc/raddb/clients.conf.back
+sudo mv /etc/raddb/users /etc/raddb/users.back
+
+3.创建radius客户端的配置文件,ipaddr输入2个域控所在的网段地址，secret输入共享密钥alcc1234.
+client localhost {
+ipaddr  = 127.0.0.1
+netmask = 32
+secret  = 'alcc1234'
+}
+client adconnector {
+ipaddr  = 172.31.0.0
+netmask = 16
+secret  = 'alcc1234'
+}
+client adconnector {
+ipaddr  = 100.64.0.0
+netmask = 16
+secret  = 'alcc1234'
+}
+
+4.下载linotp perl module for FreeRADIUS
+
+sudo git clone https://github.com/LinOTP/linotp-auth-freeradius-perl.git /usr/share/linotp/linotp-auth-freeradius-perl
+
+5.配置freeradius使用linotp插件，修改 /etc/raddb/mods-available/perl 
+替换为以下：
+perl {
+filename = /usr/share/linotp/linotp-auth-freeradius-perl/radius_linotp.pm
+}
+
+6.激活perl模块
+sudo ln -s /etc/raddb/mods-available/perl /etc/raddb/mods-enabled/perl
+
+7.配置LinOTP perl模块for freeradius，修改/etc/linotp2/rlm_perl.ini ，其中的realm用步骤二中创建的realm名称：alcc
+#IP of the linotp server
+URL=https://localhost/validate/simplecheck
+#optional: limits search for user to this realm
+REALM=alcc
+#optional: only use this UserIdResolver
+#RESCONF=flat_file
+#optional: comment out if everything seems to work fine
+Debug=True
+#optional: use this, if you have selfsigned certificates, otherwise comment out
+SSL_CHECK=False
+8.删除2个默认的link
+9. 在 ‘FreeRADIUS’里激活 ‘linotp’，创建新的配置文件 /etc/raddb/sites-available/linotp
+server default {
+listen {
+type = auth
+ipaddr = *
+port = 0
+limit {
+max_connections = 16
+lifetime = 0
+idle_timeout = 30
+}
+}
+listen {
+ipaddr = *
+port = 0
+type = acct
+}authorize {
+preprocess
+IPASS
+suffix
+ntdomain
+files
+expiration
+logintime
+update control {
+Auth-Type := Perl
+}
+pap
+}authenticate {
+Auth-Type Perl {
+perl
+}
+}preacct {
+preprocess
+acct_unique
+suffix
+files
+}accounting {
+detail
+unix
+-sql
+exec
+attr_filter.accounting_response
+}session {
+}
+post-auth {
+update {
+&reply: += &session-state:
+}
+-sql
+exec
+remove_reply_message_if_eap
+}
+}
+
+10 Activate the configuration by creating a soft linking to ‘/etc/raddb/sites-enabled’
+sudo ln -s /etc/raddb/sites-available/linotp /etc/raddb/sites-enabled/linotp
+
+11 启动radiusd服务，并enable
+sudo systemctl enable radiusd
+sudo systemctl start radiusd
+
+五、在实例上测试radius
+登陆radius实例，运行命令：
+radtest USERNAME MFACODE PRIVATERADIUSIP:1812 10 SECRETWORD
+其中username是AD域的用户名，mfacode是microsoft authenticator上的动态token，privateradiusip是radius实例的私有ip，secretword是设置的共享密码。
+
+比如：radtest aaa 811411 172.31.44.206:1812 10 alcc1234
+返回Access-Accept则验证成功。
+[ec2-user@ip-172-31-44-206 ~]$ radtest aaa 847906 172.31.44.206:1812 10 alcc1234
+Sent Access-Request Id 211 from 0.0.0.0:54025 to 172.31.44.206:1812 length 73
+	User-Name = "aaa"
+	User-Password = "847906"
+	NAS-IP-Address = 172.31.44.206
+	NAS-Port = 10
+	Message-Authenticator = 0x00
+	Cleartext-Password = "847906"
+Received Access-Accept Id 211 from 172.31.44.206:1812 to 0.0.0.0:0 length 43
+	Reply-Message = "LinOTP access granted"
+
+六、为AWS目录服务启用MFA
+1.为目录服务启用MFA，需要为ad域控的安全组添加出站的UDP 1812允许策略。目标为radius实例（或所在的网段）
+2.登陆aws管理界面，找到目录服务，点击对应的目录服务ID，进入配置界面，选择“网络和安全性”—“多重身份验证”，点击“操作”，选择“启用”，输入以下配置
+ 
+显示标签：自定义
+Radius服务器DNS名称或ip地址： radius实例的私有IP地址
+端口： 1812
+共享密码： alcc1234 
+协议：PAP
+服务器超时： 30 秒
+最大radius请求重试次数： 3
+
+点击“启用”
+
+等几分钟后，查看MFA状态：已完成。
+ 
+
+七、启动workspace客户端
+1．启动workspaces客户端，进行登陆
+ 
+可以看到多了一个MFA code的输入框。
+在分别输入用户名/密码，再输入手机app上的Microsoft Authenticator的动态code，点击“sign in“。
+ 
+在界面等几分钟后，进入workspaces的工作界面。
+
